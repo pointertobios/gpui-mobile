@@ -55,6 +55,7 @@ pub fn set_turn_listener(listener: fn(Turn)) {
 }
 
 /// Pass one reading on, if a shell asked for them.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub(crate) fn report(turn: Turn) {
     let listener = match LISTENER.lock() {
         Ok(installed) => *installed,
