@@ -1264,7 +1264,7 @@ impl AndroidWindow {
         let config = || WgpuSurfaceConfig {
             size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
             transparent,
-            preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+            preferred_present_mode: Some(wgpu::PresentMode::Fifo),
         };
 
         if gpu_context.borrow().is_some() {
@@ -1749,6 +1749,17 @@ impl PlatformWindow for AndroidPlatformWindow {
             };
             let mut active_touches = HashMap::new();
             let mut fling_guard = crate::fling_guard::FlingGuard::new();
+            // Where every finger on the glass is, so that two of them can be read
+            // as the pinch GPUI's recognizer has no way to make of them: it reads
+            // one contact at a time, and a pinch is two.
+            let mut fingers: HashMap<i32, (f32, f32)> = HashMap::new();
+            // The distance the last pinch step was measured from, while a pinch
+            // is under way.
+            let mut pinch: Option<f32> = None;
+            // Whether a gesture has become a pinch, in which case the rest of its
+            // contacts are the pinch's: no tap, no pan and no hold is made of a
+            // release that ends one.
+            let mut pinch_swallow = false;
             self.window.on_touch(move |touch| {
                 let phase = match touch.action {
                     0 => gpui::TouchPhase::Started,
@@ -1757,6 +1768,143 @@ impl PlatformWindow for AndroidPlatformWindow {
                     3 => gpui::TouchPhase::Cancelled,
                     _ => return,
                 };
+                let Some(window) = window.upgrade() else {
+                    return;
+                };
+                let scale = window.scale_factor();
+                match phase {
+                    gpui::TouchPhase::Started | gpui::TouchPhase::Moved => {
+                        fingers.insert(touch.id, (touch.x, touch.y));
+                    }
+                    gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled => {}
+                }
+                if fingers.len() >= 2 {
+                    // The pinch is measured between the first two fingers down,
+                    // and reported from the middle of them: the share the fingers
+                    // asked for this step, on top of the last one. Every contact
+                    // of the gesture is the pinch's from here, so none of them
+                    // reaches the recognizer as a tap or a pan.
+                    //
+                    // The two fingers are taken in the order the platform named
+                    // them rather than in the order a map hands them back. The
+                    // angle is the line from one of them to the other, so a pair
+                    // that swapped between two readings would read as half a turn
+                    // taken and half a turn given back.
+                    let mut ids: Vec<i32> = fingers.keys().copied().collect();
+                    ids.sort_unstable();
+                    let (first, second) = (fingers[&ids[0]], fingers[&ids[1]]);
+                    let distance =
+                        ((second.0 - first.0).powi(2) + (second.1 - first.1).powi(2)).sqrt();
+                    // The angle of the same two fingers: the line between them,
+                    // from the window's own `+x` axis, turning the way the screen
+                    // does. It is reported beside the pinch because it is the same
+                    // reading of the same two contacts — a shell that shows the
+                    // angle is handed both in one place, and a gesture that is not
+                    // a turn reports the angle it always had.
+                    let angle = (second.1 - first.1).atan2(second.0 - first.0);
+                    let started = pinch.is_none();
+                    let delta = pinch
+                        .map(|before| {
+                            if before > 0. {
+                                distance / before - 1.
+                            } else {
+                                0.
+                            }
+                        })
+                        .unwrap_or(0.);
+                    pinch = Some(distance);
+                    pinch_swallow = true;
+                    let middle = gpui::point(
+                        gpui::px((first.0 + second.0) / 2. / scale),
+                        gpui::px((first.1 + second.1) / 2. / scale),
+                    );
+                    crate::turn::report(crate::turn::Turn {
+                        angle,
+                        distance: distance / scale,
+                        center: (
+                            (first.0 + second.0) / 2. / scale,
+                            (first.1 + second.1) / 2. / scale,
+                        ),
+                        phase: if started {
+                            crate::turn::TurnPhase::Started
+                        } else {
+                            crate::turn::TurnPhase::Moved
+                        },
+                    });
+                    let mut cb = cb.lock();
+                    if started {
+                        // The recognizer was following the finger that was down
+                        // before this one, and a pinch is not that finger's
+                        // gesture: it is ended here, before the pinch's own
+                        // events, rather than left to a lift that never comes.
+                        //
+                        // What is left behind otherwise is a recognizer holding a
+                        // contact that never ends. It ignores every contact that
+                        // follows — a `Started` only takes a recognizer that is
+                        // idle — so the interface stops answering the screen
+                        // altogether, for as long as the process lives.
+                        for (_, id) in active_touches.drain() {
+                            let cancelled = gpui::TouchEvent {
+                                id,
+                                phase: gpui::TouchPhase::Cancelled,
+                                position: middle,
+                                predicted_position: None,
+                                force: None,
+                            };
+                            fling_guard.relay(cancelled, &mut next_touch_id, |event| {
+                                cb(gpui::PlatformInput::Touch(event));
+                            });
+                        }
+                    }
+                    cb(gpui::PlatformInput::Pinch(gpui::PinchEvent {
+                        position: middle,
+                        delta,
+                        modifiers: gpui::Modifiers::default(),
+                        phase: if started {
+                            gpui::TouchPhase::Started
+                        } else {
+                            gpui::TouchPhase::Moved
+                        },
+                    }));
+                    if matches!(phase, gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled) {
+                        fingers.remove(&touch.id);
+                        if fingers.len() < 2 {
+                            pinch = None;
+                            crate::turn::report(crate::turn::Turn {
+                                angle,
+                                distance: distance / scale,
+                                center: (
+                                    (first.0 + second.0) / 2. / scale,
+                                    (first.1 + second.1) / 2. / scale,
+                                ),
+                                phase: crate::turn::TurnPhase::Ended,
+                            });
+                            cb(gpui::PlatformInput::Pinch(gpui::PinchEvent {
+                                position: middle,
+                                delta: 0.,
+                                modifiers: gpui::Modifiers::default(),
+                                phase: gpui::TouchPhase::Ended,
+                            }));
+                        }
+                    }
+                    return;
+                }
+                if matches!(phase, gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled) {
+                    fingers.remove(&touch.id);
+                    if fingers.is_empty() {
+                        pinch_swallow = false;
+                    }
+                }
+                if pinch_swallow {
+                    // A finger left over from a pinch is lifted without being a
+                    // tap of its own — and without a contact of its own, since
+                    // the recognizer it belonged to was cancelled when the pinch
+                    // began.
+                    if matches!(phase, gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled) {
+                        active_touches.remove(&touch.id);
+                    }
+                    return;
+                }
                 let id = if phase == gpui::TouchPhase::Started {
                     // Android pointer IDs are reused after release.
                     let id = next_touch_id();
@@ -1768,10 +1916,6 @@ impl PlatformWindow for AndroidPlatformWindow {
                     };
                     id
                 };
-                let Some(window) = window.upgrade() else {
-                    return;
-                };
-                let scale = window.scale_factor();
                 let event = gpui::TouchEvent {
                     id,
                     phase,
