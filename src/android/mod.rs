@@ -158,6 +158,7 @@ pub(crate) mod frame_source;
 pub mod host;
 pub mod jni;
 pub mod keyboard;
+pub mod keys;
 pub mod platform;
 pub mod platform_view;
 mod text_input;

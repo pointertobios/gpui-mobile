@@ -746,6 +746,14 @@ fn process_input_events(app: &AndroidApp) {
                             let key_code: u32 = key_event.key_code().into();
                             let meta_state: u32 = key_event.meta_state().0;
 
+                            // A shell may have a use for a key GPUI has none
+                            // for, such as a volume key the system would
+                            // otherwise never see. It is answered before the
+                            // interface is offered it.
+                            if crate::android::keys::take(key_code as i32, action) {
+                                return android_activity::InputStatus::Handled;
+                            }
+
                             let unicode_char = unicode_char_for_key_event(
                                 key_code as i32,
                                 action,
